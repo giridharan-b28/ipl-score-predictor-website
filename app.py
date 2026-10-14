@@ -1,3 +1,4 @@
+import joblib
 
 import os
 import warnings
@@ -84,174 +85,53 @@ def normalize_team(value):
     return str(value).strip()
 
 
-def load_and_train():
+def load_saved_models():
     global DATA, TARGET_COL, FEATURE_COLS, CATEGORICAL_COLS, NUMERIC_COLS
     global RF_PIPELINE, XGB_PIPELINE, METRICS
     global TRAINING_ERROR, TRAINING_STATUS
 
-    TRAINING_STATUS = "Loading dataset..."
+    model_path = os.environ.get(
+        "IPL_MODEL_PATH", "saved_models.joblib"
+    )
+
+    TRAINING_STATUS = "Loading saved models..."
     TRAINING_ERROR = None
 
-    if not os.path.exists(DATA_PATH):
-        TRAINING_ERROR = (
-            f"Dataset file not found: {DATA_PATH}. "
-            "Place ipl_data.csv beside app.py."
-        )
-        TRAINING_STATUS = "Failed"
-        print("Model training failed:", TRAINING_ERROR)
-        return
-
     try:
-        print("Loading IPL dataset...", flush=True)
-        df = pd.read_csv(DATA_PATH)
+        print(f"Loading saved models from {model_path}...", flush=True)
 
-        if df.empty or len(df.columns) < 4:
-            raise ValueError(
-                "The CSV has too few columns to train a model."
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(
+                f"Saved model file not found: {model_path}"
             )
 
-        target_col = df.columns[-1]
-        feature_cols = list(df.columns[2:-1])
+        bundle = joblib.load(model_path)
 
-        if not feature_cols:
-            raise ValueError(
-                "No feature columns found between the first two "
-                "columns and target."
-            )
+        DATA = bundle["data"]
+        TARGET_COL = bundle["target_col"]
+        FEATURE_COLS = bundle["feature_cols"]
+        CATEGORICAL_COLS = bundle["categorical_cols"]
+        NUMERIC_COLS = bundle["numeric_cols"]
+        RF_PIPELINE = bundle["rf_pipeline"]
+        XGB_PIPELINE = bundle["xgb_pipeline"]
+        METRICS = bundle["metrics"]
 
-        model_df = df[feature_cols + [target_col]].copy()
-
-        model_df[target_col] = pd.to_numeric(
-            model_df[target_col], errors="coerce"
-        )
-        model_df = model_df.dropna(subset=[target_col])
-
-        for col in feature_cols:
-            if pd.api.types.is_numeric_dtype(model_df[col]):
-                model_df[col] = pd.to_numeric(
-                    model_df[col], errors="coerce"
-                )
-                median_value = model_df[col].median()
-                model_df[col] = model_df[col].fillna(
-                    median_value if pd.notna(median_value) else 0
-                )
-            else:
-                model_df[col] = (
-                    model_df[col].fillna("Unknown").astype(str)
-                )
-
-        if len(model_df) < 10:
-            raise ValueError(
-                "At least 10 valid rows are needed to train the models."
-            )
-
-        X = model_df[feature_cols]
-        y = model_df[target_col]
-
-        cat_cols = [
-            c for c in feature_cols
-            if not pd.api.types.is_numeric_dtype(X[c])
-        ]
-        num_cols = [c for c in feature_cols if c not in cat_cols]
-
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=32
-        )
-
-        def make_preprocessor():
-            try:
-                enc = OneHotEncoder(
-                    handle_unknown="ignore",
-                    sparse_output=True
-                )
-            except TypeError:
-                enc = OneHotEncoder(
-                    handle_unknown="ignore",
-                    sparse=True
-                )
-
-            return ColumnTransformer(
-                [
-                    ("categorical", enc, cat_cols),
-                    ("numeric", "passthrough", num_cols),
-                ],
-                remainder="drop",
-            )
-
-        rf = Pipeline([
-            ("preprocessor", make_preprocessor()),
-            ("model", RandomForestRegressor(
-                n_estimators=50,
-                random_state=0,
-                n_jobs=2,
-            )),
-        ])
-
-        xgb = Pipeline([
-            ("preprocessor", make_preprocessor()),
-            ("model", XGBRegressor(
-                n_estimators=300,
-                learning_rate=0.05,
-                max_depth=5,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                objective="reg:squarederror",
-                random_state=42,
-                n_jobs=2,
-            )),
-        ])
-
-        TRAINING_STATUS = "Training Random Forest model..."
-        print(TRAINING_STATUS, flush=True)
-        rf.fit(X_train, y_train)
-
-        TRAINING_STATUS = "Training XGBoost model..."
-        print(TRAINING_STATUS, flush=True)
-        xgb.fit(X_train, y_train)
-
-        print("Calculating model metrics...", flush=True)
-
-        rf_r2 = float(r2_score(y_test, rf.predict(X_test)))
-        xgb_r2 = float(r2_score(y_test, xgb.predict(X_test)))
-
-        # Publish the trained models only after both are ready.
-        DATA = df
-        TARGET_COL = target_col
-        FEATURE_COLS = feature_cols
-        CATEGORICAL_COLS = cat_cols
-        NUMERIC_COLS = num_cols
-        RF_PIPELINE = rf
-        XGB_PIPELINE = xgb
-
-        METRICS = {
-            "random_forest": {
-                "r2": round(rf_r2 * 100, 2)
-            },
-            "xgboost": {
-                "r2": round(xgb_r2 * 100, 2)
-            },
-        }
-
-        TRAINING_ERROR = None
         TRAINING_STATUS = "Ready"
-
         print("Model status: Ready", flush=True)
         print("R² percentages:", METRICS, flush=True)
 
     except Exception as exc:
+        DATA = None
+        RF_PIPELINE = None
+        XGB_PIPELINE = None
+        METRICS = {}
         TRAINING_ERROR = str(exc)
         TRAINING_STATUS = "Failed"
-        print("Model training failed:", TRAINING_ERROR, flush=True)
+        print("Saved model loading failed:", TRAINING_ERROR, flush=True)
 
 
-# Start training in the background so Gunicorn can start Flask
-# and bind to Render's assigned port without waiting for training.
-_training_thread = threading.Thread(
-    target=load_and_train,
-    name="ipl-model-training",
-    daemon=True,
-)
-_training_thread.start()
+# Load pre-trained models instead of retraining at every startup.
+load_saved_models()
 
 
 def get_ui_columns():
