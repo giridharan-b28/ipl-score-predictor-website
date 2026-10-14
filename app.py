@@ -1,6 +1,8 @@
 
 import os
 import warnings
+import threading
+
 import numpy as np
 import pandas as pd
 from flask import Flask, render_template, request, jsonify
@@ -17,16 +19,25 @@ warnings.filterwarnings("ignore")
 app = Flask(__name__)
 
 DATA_PATH = os.environ.get("IPL_DATA_PATH", "ipl_data.csv")
+
 DATA = None
 TARGET_COL = None
 FEATURE_COLS, CATEGORICAL_COLS, NUMERIC_COLS = [], [], []
 RF_PIPELINE = XGB_PIPELINE = None
 METRICS = {}
 TRAINING_ERROR = None
+TRAINING_STATUS = "Waiting to start model training..."
 
 ALIASES = {
-    "batting": ["batting_team", "bat_team", "batting team", "team_batting", "battingteam", "batting side"],
-    "bowling": ["bowling_team", "bowl_team", "bowling team", "team_bowling", "bowlingteam", "bowling side", "bowl_team_name"],
+    "batting": [
+        "batting_team", "bat_team", "batting team",
+        "team_batting", "battingteam", "batting side"
+    ],
+    "bowling": [
+        "bowling_team", "bowl_team", "bowling team",
+        "team_bowling", "bowlingteam", "bowling side",
+        "bowl_team_name"
+    ],
     "venue": ["venue", "stadium", "ground", "city", "match_venue"],
     "over": ["current_over", "overs", "over", "over_number", "overs_completed"],
     "wickets": ["current_wickets", "wickets", "wicket", "wickets_lost", "total_wickets"],
@@ -43,7 +54,9 @@ TEAM_ALIASES = {
 
 
 def norm(value):
-    return "".join(ch for ch in str(value).lower().strip() if ch.isalnum())
+    return "".join(
+        ch for ch in str(value).lower().strip() if ch.isalnum()
+    )
 
 
 def find_col(df, candidates):
@@ -73,30 +86,41 @@ def normalize_team(value):
 
 def load_and_train():
     global DATA, TARGET_COL, FEATURE_COLS, CATEGORICAL_COLS, NUMERIC_COLS
-    global RF_PIPELINE, XGB_PIPELINE, METRICS, TRAINING_ERROR
+    global RF_PIPELINE, XGB_PIPELINE, METRICS
+    global TRAINING_ERROR, TRAINING_STATUS
+
+    TRAINING_STATUS = "Loading dataset..."
+    TRAINING_ERROR = None
 
     if not os.path.exists(DATA_PATH):
         TRAINING_ERROR = (
             f"Dataset file not found: {DATA_PATH}. "
             "Place ipl_data.csv beside app.py."
         )
+        TRAINING_STATUS = "Failed"
+        print("Model training failed:", TRAINING_ERROR)
         return
 
     try:
+        print("Loading IPL dataset...", flush=True)
         df = pd.read_csv(DATA_PATH)
 
         if df.empty or len(df.columns) < 4:
-            raise ValueError("The CSV has too few columns to train a model.")
+            raise ValueError(
+                "The CSV has too few columns to train a model."
+            )
 
         target_col = df.columns[-1]
         feature_cols = list(df.columns[2:-1])
 
         if not feature_cols:
             raise ValueError(
-                "No feature columns found between the first two columns and target."
+                "No feature columns found between the first two "
+                "columns and target."
             )
 
         model_df = df[feature_cols + [target_col]].copy()
+
         model_df[target_col] = pd.to_numeric(
             model_df[target_col], errors="coerce"
         )
@@ -107,8 +131,9 @@ def load_and_train():
                 model_df[col] = pd.to_numeric(
                     model_df[col], errors="coerce"
                 )
+                median_value = model_df[col].median()
                 model_df[col] = model_df[col].fillna(
-                    model_df[col].median()
+                    median_value if pd.notna(median_value) else 0
                 )
             else:
                 model_df[col] = (
@@ -120,7 +145,8 @@ def load_and_train():
                 "At least 10 valid rows are needed to train the models."
             )
 
-        X, y = model_df[feature_cols], model_df[target_col]
+        X = model_df[feature_cols]
+        y = model_df[target_col]
 
         cat_cols = [
             c for c in feature_cols
@@ -135,11 +161,13 @@ def load_and_train():
         def make_preprocessor():
             try:
                 enc = OneHotEncoder(
-                    handle_unknown="ignore", sparse_output=True
+                    handle_unknown="ignore",
+                    sparse_output=True
                 )
             except TypeError:
                 enc = OneHotEncoder(
-                    handle_unknown="ignore", sparse=True
+                    handle_unknown="ignore",
+                    sparse=True
                 )
 
             return ColumnTransformer(
@@ -153,9 +181,9 @@ def load_and_train():
         rf = Pipeline([
             ("preprocessor", make_preprocessor()),
             ("model", RandomForestRegressor(
-                n_estimators=150,
+                n_estimators=50,
                 random_state=0,
-                n_jobs=-1,
+                n_jobs=2,
             )),
         ])
 
@@ -173,15 +201,20 @@ def load_and_train():
             )),
         ])
 
-        print("Training Random Forest model...")
+        TRAINING_STATUS = "Training Random Forest model..."
+        print(TRAINING_STATUS, flush=True)
         rf.fit(X_train, y_train)
 
-        print("Training XGBoost model...")
+        TRAINING_STATUS = "Training XGBoost model..."
+        print(TRAINING_STATUS, flush=True)
         xgb.fit(X_train, y_train)
+
+        print("Calculating model metrics...", flush=True)
 
         rf_r2 = float(r2_score(y_test, rf.predict(X_test)))
         xgb_r2 = float(r2_score(y_test, xgb.predict(X_test)))
 
+        # Publish the trained models only after both are ready.
         DATA = df
         TARGET_COL = target_col
         FEATURE_COLS = feature_cols
@@ -191,28 +224,34 @@ def load_and_train():
         XGB_PIPELINE = xgb
 
         METRICS = {
-            "random_forest": {"r2": round(rf_r2 * 100, 2)},
-            "xgboost": {"r2": round(xgb_r2 * 100, 2)},
+            "random_forest": {
+                "r2": round(rf_r2 * 100, 2)
+            },
+            "xgboost": {
+                "r2": round(xgb_r2 * 100, 2)
+            },
         }
 
         TRAINING_ERROR = None
+        TRAINING_STATUS = "Ready"
+
+        print("Model status: Ready", flush=True)
+        print("R² percentages:", METRICS, flush=True)
 
     except Exception as exc:
         TRAINING_ERROR = str(exc)
-        print("Model training failed:", TRAINING_ERROR)
+        TRAINING_STATUS = "Failed"
+        print("Model training failed:", TRAINING_ERROR, flush=True)
 
 
-# IMPORTANT:
-# Train the models when Gunicorn imports this file on Render.
-# This call is outside the __main__ block so it also runs under Gunicorn.
-load_and_train()
-
-print(
-    "Model status:",
-    "Ready" if not TRAINING_ERROR else TRAINING_ERROR,
+# Start training in the background so Gunicorn can start Flask
+# and bind to Render's assigned port without waiting for training.
+_training_thread = threading.Thread(
+    target=load_and_train,
+    name="ipl-model-training",
+    daemon=True,
 )
-if METRICS:
-    print("R² percentages:", METRICS)
+_training_thread.start()
 
 
 def get_ui_columns():
@@ -422,9 +461,14 @@ def index():
 @app.get("/api/options")
 def api_options():
     if DATA is None:
+        if TRAINING_ERROR:
+            message = TRAINING_ERROR
+        else:
+            message = TRAINING_STATUS
+
         return jsonify({
-            "error": TRAINING_ERROR
-            or "Model training did not complete. Check ipl_data.csv."
+            "status": TRAINING_STATUS,
+            "error": message,
         }), 503
 
     cols = get_ui_columns()
@@ -439,6 +483,7 @@ def api_options():
     venues = available_values(cols.get("venue"))
 
     return jsonify({
+        "status": TRAINING_STATUS,
         "teams": teams,
         "venues": venues,
         "columns_detected": {
@@ -448,11 +493,27 @@ def api_options():
     })
 
 
+@app.get("/api/status")
+def api_status():
+    return jsonify({
+        "status": TRAINING_STATUS,
+        "ready": (
+            DATA is not None
+            and RF_PIPELINE is not None
+            and XGB_PIPELINE is not None
+        ),
+        "error": TRAINING_ERROR,
+        "metrics": METRICS,
+    })
+
+
 @app.post("/api/predict")
 def api_predict():
     if DATA is None or RF_PIPELINE is None or XGB_PIPELINE is None:
+        message = TRAINING_ERROR or TRAINING_STATUS
         return jsonify({
-            "error": TRAINING_ERROR or "Models are not ready."
+            "status": TRAINING_STATUS,
+            "error": message,
         }), 503
 
     payload = request.get_json(silent=True) or {}
@@ -499,17 +560,17 @@ def api_predict():
         })
 
     except Exception as exc:
+        app.logger.exception("Prediction failed")
         return jsonify({
             "error": f"Prediction failed: {exc}"
         }), 500
 
 
 if __name__ == "__main__":
-    # Models have already been initialized above.
-    # Do not call load_and_train() again here.
     app.run(
         host="0.0.0.0",
         port=int(os.environ.get("PORT", "5000")),
         debug=False,
+        threaded=True,
     )
 
